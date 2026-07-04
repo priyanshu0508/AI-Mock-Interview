@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { db } from "@/utils/db";
 import { MockInterview, UserAnswer } from "@/utils/schema";
@@ -50,16 +50,47 @@ export default function StartInterviewPage() {
   >([]);
   const [activeQuestionIndex, setActiveQuestionIndex] = useState(0);
   const [userAnswer, setUserAnswer] = useState("");
+  const [answersByQuestion, setAnswersByQuestion] = useState<Record<number, string>>({});
+  const [answeredQuestions, setAnsweredQuestions] = useState<Record<number, boolean>>({});
   const [isRecording, setIsRecording] = useState(false);
   const [loading, setLoading] = useState(false);
   const [webCamEnabled, setWebCamEnabled] = useState(true);
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const [recognition, setRecognition] = useState<any>(null);
+  const [statusMessage, setStatusMessage] = useState<string | null>(null);
+  const recognitionRef = useRef<any>(null);
+  const startRecognitionRef = useRef<() => void>(() => {});
+  const recognitionActiveRef = useRef(false);
+  const recognitionStartingRef = useRef(false);
+  const pendingRecognitionRestartRef = useRef(false);
+  const keepRecordingRef = useRef(false);
+  const activeQuestionIndexRef = useRef(0);
+
+  const shuffleArray = <T,>(array: T[]): T[] => {
+    const copy = [...array];
+    for (let i = copy.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [copy[i], copy[j]] = [copy[j], copy[i]];
+    }
+    return copy;
+  };
+
+  const getInterviewDetails = useCallback(async () => {
+    const result = await db
+      .select()
+      .from(MockInterview)
+      .where(eq(MockInterview.mockId, params.interviewId as string));
+
+    const jsonMockResp = JSON.parse(result[0].jsonMockResp);
+    setMockInterviewQuestions(shuffleArray(jsonMockResp));
+    setInterviewData(result[0]);
+  }, [params.interviewId]);
 
   useEffect(() => {
     getInterviewDetails();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [getInterviewDetails]);
+
+  useEffect(() => {
+    activeQuestionIndexRef.current = activeQuestionIndex;
+  }, [activeQuestionIndex]);
 
   useEffect(() => {
     if (typeof window !== "undefined") {
@@ -73,44 +104,162 @@ export default function StartInterviewPage() {
         rec.continuous = true;
         rec.interimResults = false;
         rec.lang = "en-US";
+
+        const safeStartRecognition = () => {
+          if (!rec || recognitionActiveRef.current || recognitionStartingRef.current) {
+            return;
+          }
+          try {
+            recognitionStartingRef.current = true;
+            rec.start();
+          } catch (error) {
+            recognitionStartingRef.current = false;
+            console.error("Unable to start speech recognition:", error);
+          }
+        };
+
+        const scheduleRestart = () => {
+          if (!keepRecordingRef.current) {
+            return;
+          }
+          if (pendingRecognitionRestartRef.current) {
+            return;
+          }
+          pendingRecognitionRestartRef.current = true;
+          setTimeout(() => {
+            pendingRecognitionRestartRef.current = false;
+            safeStartRecognition();
+          }, 300);
+        };
+
+        rec.onstart = () => {
+          recognitionActiveRef.current = true;
+          recognitionStartingRef.current = false;
+          setStatusMessage("Recording... Please speak clearly into your microphone.");
+        };
+
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         rec.onresult = (event: any) => {
           let transcript = "";
           for (let i = event.resultIndex; i < event.results.length; i++) {
-            transcript += event.results[i][0].transcript;
+            if (event.results[i][0]?.transcript) {
+              transcript += event.results[i][0].transcript;
+            }
           }
-          setUserAnswer((prev) => prev + " " + transcript);
+
+          setUserAnswer((prev) => {
+            const nextValue = `${prev} ${transcript}`.trim();
+            setAnswersByQuestion((prevAnswers) => ({
+              ...prevAnswers,
+              [activeQuestionIndexRef.current]: nextValue,
+            }));
+            return nextValue;
+          });
         };
-        rec.onerror = () => {
+
+        rec.onerror = (event: any) => {
+          const errorName = event?.error || event?.type || "unknown";
+          const errorMessage = event?.message || String(errorName);
+
+          console.warn("Speech recognition error:", errorName, errorMessage, event);
+          recognitionActiveRef.current = false;
+          recognitionStartingRef.current = false;
+
+          if (!keepRecordingRef.current) {
+            setIsRecording(false);
+            setStatusMessage("Recording stopped.");
+            return;
+          }
+
+          if (errorName === "not-allowed" || errorName === "service-not-allowed") {
+            setIsRecording(false);
+            setStatusMessage(
+              "Microphone access was denied. Please allow microphone use and try again."
+            );
+            return;
+          }
+
+          if (errorName === "aborted") {
+            setIsRecording(false);
+            setStatusMessage("Recording was aborted. Please try again.");
+            return;
+          }
+
+          if (errorName === "audio-capture" || errorName === "no-speech") {
+            setStatusMessage(
+              "No speech detected. Please speak clearly and try again."
+            );
+            scheduleRestart();
+            return;
+          }
+
+          setStatusMessage("Speech recognition stopped unexpectedly. Resuming recording...");
+          scheduleRestart();
+        };
+
+        rec.onend = () => {
+          recognitionActiveRef.current = false;
+          recognitionStartingRef.current = false;
+          if (keepRecordingRef.current) {
+            scheduleRestart();
+            return;
+          }
+
           setIsRecording(false);
         };
-        setRecognition(rec);
+
+        recognitionRef.current = rec;
+        startRecognitionRef.current = safeStartRecognition;
       }
     }
   }, []);
 
-  const getInterviewDetails = async () => {
-    const result = await db
-      .select()
-      .from(MockInterview)
-      .where(eq(MockInterview.mockId, params.interviewId as string));
+  const stopRecognition = () => {
+    if (recognitionRef.current && isRecording) {
+      keepRecordingRef.current = false;
+      try {
+        recognitionRef.current.stop();
+      } catch (error) {
+        console.error("Error stopping speech recognition:", error);
+      }
+      setIsRecording(false);
+      setStatusMessage("Recording stopped. Your answer is ready for submission.");
+    }
+  };
 
-    const jsonMockResp = JSON.parse(result[0].jsonMockResp);
-    setMockInterviewQuestions(jsonMockResp);
-    setInterviewData(result[0]);
+  const handleQuestionChange = async (nextIndex: number) => {
+    if (nextIndex === activeQuestionIndexRef.current) {
+      return;
+    }
+
+    stopRecognition();
+    await updateUserAnswer(activeQuestionIndexRef.current);
+    setActiveQuestionIndex(nextIndex);
+    activeQuestionIndexRef.current = nextIndex;
+    setUserAnswer(answersByQuestion[nextIndex] || "");
+    setStatusMessage(null);
   };
 
   const startStopRecording = () => {
-    if (!recognition) return;
+    if (!recognitionRef.current) {
+      setStatusMessage("Speech recognition is not available in this browser.");
+      return;
+    }
 
     if (isRecording) {
-      recognition.stop();
-      setIsRecording(false);
-    } else {
-      setUserAnswer("");
-      recognition.start();
-      setIsRecording(true);
+      stopRecognition();
+      return;
     }
+
+    keepRecordingRef.current = true;
+    setUserAnswer("");
+    setAnswersByQuestion((prev) => ({
+      ...prev,
+      [activeQuestionIndexRef.current]: "",
+    }));
+    setStatusMessage("Recording... Please speak clearly into your microphone.");
+    startRecognitionRef.current();
+    setIsRecording(true);
   };
 
   const textToSpeech = (text: string) => {
@@ -120,11 +269,20 @@ export default function StartInterviewPage() {
     }
   };
 
-  const updateUserAnswer = useCallback(async () => {
-    if (!userAnswer || userAnswer.trim().length < 5 || !interviewData) return;
+  const updateUserAnswer = useCallback(async (questionIndex = activeQuestionIndexRef.current) => {
+    const currentAnswer = (answersByQuestion[questionIndex] || userAnswer || "").trim();
+
+    if (!interviewData || !currentAnswer) {
+      setStatusMessage("No answer was recorded for this question, so it was skipped.");
+      return true;
+    }
+
+    if (answeredQuestions[questionIndex]) {
+      return true;
+    }
 
     setLoading(true);
-    const feedbackPrompt = `Question: ${mockInterviewQuestions[activeQuestionIndex]?.question}, User Answer: ${userAnswer}. Based on the question and user answer, please give a rating (1-10) and feedback in 3-5 lines in JSON format with "rating" and "feedback" fields.`;
+    const feedbackPrompt = `Question: ${mockInterviewQuestions[questionIndex]?.question}, User Answer: ${currentAnswer}. Based on the question and user answer, please return only valid JSON with keys "rating" and "feedback". The rating should be an integer from 1 to 10, and feedback should be a concise summary in 3-5 sentences.`;
 
     try {
       const result = await chatSession.sendMessage(feedbackPrompt);
@@ -135,41 +293,66 @@ export default function StartInterviewPage() {
         .trim();
 
       const jsonFeedbackResp = JSON.parse(mockJsonResp);
+      const rating = Number(jsonFeedbackResp?.rating);
+      const feedback = String(jsonFeedbackResp?.feedback || "").trim();
+
+      if (!feedback || Number.isNaN(rating) || rating < 1 || rating > 10) {
+        setStatusMessage("AI response was invalid or incomplete. Please try recording your answer again.");
+        return false;
+      }
 
       await db.insert(UserAnswer).values({
         mockIdRef: interviewData.mockId,
-        question: mockInterviewQuestions[activeQuestionIndex]?.question,
-        correctAns: mockInterviewQuestions[activeQuestionIndex]?.answer,
-        userAns: userAnswer,
-        feedback: jsonFeedbackResp?.feedback,
-        rating: String(jsonFeedbackResp?.rating),
+        question: mockInterviewQuestions[questionIndex]?.question,
+        correctAns: mockInterviewQuestions[questionIndex]?.answer,
+        userAns: currentAnswer,
+        feedback,
+        rating: String(rating),
         userEmail: user?.primaryEmailAddress?.emailAddress || "",
         createdAt: moment().format("YYYY-MM-DD"),
       });
 
+      setAnsweredQuestions((prev) => ({ ...prev, [questionIndex]: true }));
+      setAnswersByQuestion((prev) => ({ ...prev, [questionIndex]: currentAnswer }));
+      setStatusMessage("Answer recorded and validated successfully.");
       setUserAnswer("");
+      return true;
     } catch (error) {
       console.error("Error saving answer:", error);
+      setStatusMessage("Unable to validate your answer right now. Please try again.");
+      return false;
     } finally {
       setLoading(false);
     }
-  }, [userAnswer, interviewData, mockInterviewQuestions, activeQuestionIndex, user]);
+  }, [answersByQuestion, answeredQuestions, interviewData, mockInterviewQuestions, user, userAnswer]);
 
   const handleNext = async () => {
-    await updateUserAnswer();
+    stopRecognition();
+    await updateUserAnswer(activeQuestionIndexRef.current);
     if (activeQuestionIndex < mockInterviewQuestions.length - 1) {
-      setActiveQuestionIndex(activeQuestionIndex + 1);
+      const nextIndex = activeQuestionIndex + 1;
+      setActiveQuestionIndex(nextIndex);
+      activeQuestionIndexRef.current = nextIndex;
+      setUserAnswer(answersByQuestion[nextIndex] || "");
+      setStatusMessage(null);
     }
   };
 
-  const handlePrevious = () => {
+  const handlePrevious = async () => {
     if (activeQuestionIndex > 0) {
-      setActiveQuestionIndex(activeQuestionIndex - 1);
+      stopRecognition();
+      await updateUserAnswer(activeQuestionIndexRef.current);
+      const previousIndex = activeQuestionIndex - 1;
+      setActiveQuestionIndex(previousIndex);
+      activeQuestionIndexRef.current = previousIndex;
+      setUserAnswer(answersByQuestion[previousIndex] || "");
+      setStatusMessage(null);
     }
   };
 
   const handleEndInterview = async () => {
-    await updateUserAnswer();
+    stopRecognition();
+    await updateUserAnswer(activeQuestionIndexRef.current);
     router.push(`/dashboard/interview/${params.interviewId}/feedback`);
   };
 
@@ -190,7 +373,7 @@ export default function StartInterviewPage() {
             {mockInterviewQuestions.map((_, index) => (
               <h2
                 key={index}
-                onClick={() => setActiveQuestionIndex(index)}
+                onClick={() => void handleQuestionChange(index)}
                 className={`p-2 border rounded-full text-xs md:text-sm text-center cursor-pointer px-5
                 ${activeQuestionIndex === index ? "bg-primary text-white" : ""}
                 `}
@@ -252,6 +435,17 @@ export default function StartInterviewPage() {
                 </h2>
               )}
             </Button>
+          </div>
+
+          {statusMessage ? (
+            <div className="mt-4 rounded-lg border border-blue-200 bg-blue-50 p-4 text-sm text-blue-800">
+              {statusMessage}
+            </div>
+          ) : null}
+
+          <div className="mt-4 rounded-lg border border-slate-200 bg-slate-50 p-4 text-sm text-slate-800">
+            <h3 className="font-semibold mb-2">Captured Answer</h3>
+            <p>{userAnswer || "No answer recorded yet."}</p>
           </div>
         </div>
       </div>

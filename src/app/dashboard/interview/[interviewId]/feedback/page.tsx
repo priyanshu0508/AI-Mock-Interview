@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { db } from "@/utils/db";
-import { UserAnswer } from "@/utils/schema";
+import { UserAnswer, MockInterview } from "@/utils/schema";
 import { eq } from "drizzle-orm";
 import { Button } from "@/components/ui/button";
 import {
@@ -23,6 +23,8 @@ import {
   Share2,
   Check,
 } from "lucide-react";
+import { chatSession } from "@/utils/GeminiAIModal";
+import { v4 as uuidv4 } from "uuid";
 
 interface FeedbackData {
   id: number;
@@ -43,6 +45,7 @@ export default function FeedbackPage() {
   const [loading, setLoading] = useState(true);
   const [retaking, setRetaking] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   useEffect(() => {
     getFeedback();
@@ -63,13 +66,49 @@ export default function FeedbackPage() {
   // Feature 1: Retake Interview — delete all previous answers and go back to start
   const handleRetake = async () => {
     setRetaking(true);
+    setErrorMessage(null);
+
     try {
-      await db
-        .delete(UserAnswer)
-        .where(eq(UserAnswer.mockIdRef, params.interviewId as string));
-      router.push(`/dashboard/interview/${params.interviewId}/start`);
-    } catch (error) {
-      console.error("Error clearing previous answers:", error);
+      const interviewResult = await db
+        .select()
+        .from(MockInterview)
+        .where(eq(MockInterview.mockId, params.interviewId as string));
+
+      const interviewDetails = interviewResult[0];
+      if (!interviewDetails) {
+        throw new Error("Interview details not found.");
+      }
+
+      const inputPrompt = `Job position: ${interviewDetails.jobPosition}, Job Description: ${interviewDetails.jobDesc}, Years of Experience: ${interviewDetails.jobExperience}. Based on this information, please give me 5 interview questions with answers in JSON format. Give me the questions and answers as a JSON array with fields \"question\" and \"answer\".`;
+
+      const result = await chatSession.sendMessage(inputPrompt);
+      const mockJsonResp = result.response
+        .text()
+        .replace("```json", "")
+        .replace("```", "")
+        .trim();
+
+      if (!mockJsonResp) {
+        throw new Error("AI did not return a new question set.");
+      }
+
+      const newMockId = uuidv4();
+      await db.insert(MockInterview).values({
+        mockId: newMockId,
+        jsonMockResp: mockJsonResp,
+        jobPosition: interviewDetails.jobPosition,
+        jobDesc: interviewDetails.jobDesc,
+        jobExperience: interviewDetails.jobExperience,
+        createdBy: interviewDetails.createdBy,
+        createdAt: interviewDetails.createdAt,
+      });
+
+      router.push(`/dashboard/interview/${newMockId}/start`);
+    } catch (error: any) {
+      console.error("Error generating new interview attempt:", error);
+      setErrorMessage(
+        error?.message || "Unable to generate a new interview attempt. Please try again."
+      );
       setRetaking(false);
     }
   };
@@ -157,7 +196,27 @@ export default function FeedbackPage() {
         </>
       )}
 
-      <Button onClick={() => router.push("/dashboard")} className="mt-5">Go Home</Button>
+      {errorMessage ? (
+        <div className="mt-4 rounded-lg border border-red-200 bg-red-50 p-4 text-sm text-red-700">
+          {errorMessage}
+        </div>
+      ) : null}
+
+      <div className="flex gap-4 mt-5">
+        <Button onClick={() => router.push("/dashboard")}>
+          Go Home
+        </Button>
+        <Button onClick={handleRetake} disabled={retaking || loading}>
+          {retaking ? (
+            <>
+              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+              Generating New Attempt
+            </>
+          ) : (
+            "Retake Interview"
+          )}
+        </Button>
+      </div>
     </div>
   );
 }

@@ -91,22 +91,39 @@ export default function InterviewList() {
       {interviewList.map((interview) => (
         <div
           key={interview.id}
-          className="border shadow-sm rounded-lg p-3"
+          className="relative border shadow-sm rounded-lg p-4 overflow-hidden"
         >
-          <h2 className="font-bold text-primary line-clamp-1">
-            {interview.jobPosition}
-          </h2>
-          <h2 className="text-sm text-gray-600 line-clamp-1">
-            {interview.jobExperience} Years of Experience
-          </h2>
-          <h2 className="text-xs text-gray-400">
-            Created At: {interview.createdAt}
-          </h2>
-          <div className="flex justify-between mt-2 gap-5">
+          <Button
+            size="sm"
+            variant="ghost"
+            className="absolute top-3 right-3 text-red-600 hover:bg-red-100"
+            onClick={(e) => handleDelete(interview.mockId, e)}
+            disabled={deletingId === interview.mockId}
+          >
+            {deletingId === interview.mockId ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <Trash2 className="h-4 w-4" />
+            )}
+          </Button>
+
+          <div className="space-y-2 pr-10">
+            <h2 className="font-bold text-primary text-lg line-clamp-1">
+              {interview.jobPosition}
+            </h2>
+            <h2 className="text-sm text-gray-600 line-clamp-1">
+              {interview.jobExperience} Years of Experience
+            </h2>
+            <p className="text-xs text-gray-400">
+              Created At: {interview.createdAt}
+            </p>
+          </div>
+
+          <div className="grid grid-cols-2 gap-2 mt-4">
             <Button
               size="sm"
               variant="outline"
-              className="flex-1"
+              className="min-w-0"
               onClick={() =>
                 router.push(
                   `/dashboard/interview/${interview.mockId}/feedback`
@@ -117,7 +134,7 @@ export default function InterviewList() {
             </Button>
             <Button
               size="sm"
-              className="flex-1"
+              className="min-w-0"
               onClick={() =>
                 router.push(`/dashboard/interview/${interview.mockId}`)
               }
